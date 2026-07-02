@@ -1,4 +1,4 @@
-# DSpace Cloud-Agnostic Installer
+# DSpace Cloud Installer
 
 Single Bash scripts that install the complete DSpace stack (PostgreSQL, Apache Solr, Apache Tomcat, DSpace backend, Angular frontend under PM2) on a fresh Ubuntu 22.04/24.04 VM on **any cloud provider**: AWS, Azure, GCP, or bare metal.
 
