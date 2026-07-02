@@ -18,7 +18,7 @@ sudo bash install-dspace10.sh
 Alternative: in the AWS Console use **EC2 → Instance → Connect → EC2 Instance Connect** (browser shell), then fetch the script directly:
 
 ```bash
-wget https://raw.githubusercontent.com/<user>/dspace-installer/main/install-dspace10.sh
+wget https://raw.githubusercontent.com/RideepBty/dspace-installer/main/install-dspace10.sh
 sudo bash install-dspace10.sh
 ```
 
@@ -36,7 +36,7 @@ Alternative: **Azure Cloud Shell** (portal, `>_` icon) with the CLI:
 
 ```bash
 az vm run-command invoke -g <RESOURCE_GROUP> -n <VM_NAME> --command-id RunShellScript \
-  --scripts "wget -qO /tmp/i.sh https://raw.githubusercontent.com/<user>/dspace-installer/main/install-dspace10.sh && ASSUME_YES=1 DB_PASS=... ADMIN_PASS=... ADMIN_EMAIL=you@x.org bash /tmp/i.sh"
+  --scripts "wget -qO /tmp/i.sh https://raw.githubusercontent.com/RideepBty/dspace-installer/main/install-dspace10.sh && ASSUME_YES=1 DB_PASS=... ADMIN_PASS=... ADMIN_EMAIL=you@x.org bash /tmp/i.sh"
 ```
 
 (Use unattended mode here - `run-command` has no interactive terminal.)
@@ -62,7 +62,7 @@ Alternative: click **SSH** next to the instance in the Cloud Console (browser sh
 
 ```bash
 ssh <user>@<PUBLIC_IP>
-wget https://raw.githubusercontent.com/<user>/dspace-installer/main/install-dspace10.sh
+wget https://raw.githubusercontent.com/RideepBty/dspace-installer/main/install-dspace10.sh
 sudo bash install-dspace10.sh
 ```
 
