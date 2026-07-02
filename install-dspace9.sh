@@ -59,18 +59,22 @@ ask_secret() {
   printf -v "$var" '%s' "$val"
 }
 
+is_ip() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
 detect_ip() {
   local ip="" tok
-  tok="$(curl -s --max-time 2 -X PUT 'http://169.254.169.254/latest/api/token' \
+  tok="$(curl -sf --max-time 2 -X PUT 'http://169.254.169.254/latest/api/token' \
     -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' 2>/dev/null || true)"
-  [[ -n "$tok" ]] && ip="$(curl -s --max-time 2 -H "X-aws-ec2-metadata-token: $tok" \
+  [[ -n "$tok" ]] && ip="$(curl -sf --max-time 2 -H "X-aws-ec2-metadata-token: $tok" \
     'http://169.254.169.254/latest/meta-data/public-ipv4' 2>/dev/null || true)"
-  [[ -z "$ip" ]] && ip="$(curl -s --max-time 2 -H 'Metadata-Flavor: Google' \
+  is_ip "$ip" || ip=""
+  [[ -z "$ip" ]] && ip="$(curl -sf --max-time 2 -H 'Metadata-Flavor: Google' \
     'http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip' 2>/dev/null || true)"
-  [[ -z "$ip" ]] && ip="$(curl -s --max-time 2 -H 'Metadata: true' \
+  is_ip "$ip" || ip=""
+  [[ -z "$ip" ]] && ip="$(curl -sf --max-time 2 -H 'Metadata: true' \
     'http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress?api-version=2021-02-01&format=text' 2>/dev/null || true)"
-  [[ -z "$ip" ]] && ip="$(curl -s --max-time 3 'https://checkip.amazonaws.com' 2>/dev/null | tr -d '[:space:]' || true)"
-  [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || ip=""
+  is_ip "$ip" || ip=""
+  [[ -z "$ip" ]] && ip="$(curl -sf --max-time 3 'https://checkip.amazonaws.com' 2>/dev/null | tr -d '[:space:]' || true)"
+  is_ip "$ip" || ip=""
   printf '%s' "$ip"
 }
 
@@ -186,8 +190,9 @@ if [[ ! -d "$TOMCAT_DIR" ]]; then
   mv "${INSTALL_ROOT}/apache-tomcat-${TOMCAT_VERSION}" "$TOMCAT_DIR"
   chown -R "$DSPACE_USER:$DSPACE_USER" "$TOMCAT_DIR"
 fi
-sed -i "s|<Connector port=\"8080\"|<Connector port=\"${REST_PORT}\" URIEncoding=\"UTF-8\"|" \
-  "${TOMCAT_DIR}/conf/server.xml"
+grep -q 'URIEncoding="UTF-8"' "${TOMCAT_DIR}/conf/server.xml" || \
+  sed -i "s|<Connector port=\"8080\"|<Connector port=\"${REST_PORT}\" URIEncoding=\"UTF-8\"|" \
+    "${TOMCAT_DIR}/conf/server.xml"
 
 SRC="DSpace-dspace-${DSPACE_VERSION}"
 log "Downloading DSpace ${DSPACE_VERSION} source"
