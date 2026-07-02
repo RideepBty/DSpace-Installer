@@ -10,10 +10,11 @@ die()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 
 ASSUME_YES="${ASSUME_YES:-0}"
 
-DSPACE_VERSION="${DSPACE_VERSION:-9.2}"
+DSPACE_VERSION="${DSPACE_VERSION:-10.0}"
 SOLR_VERSION="${SOLR_VERSION:-9.10.1}"
 TOMCAT_VERSION="${TOMCAT_VERSION:-10.1.55}"
-NODE_VERSION="${NODE_VERSION:-20}"
+MAVEN_VERSION="${MAVEN_VERSION:-3.9.9}"
+NODE_VERSION="${NODE_VERSION:-22}"
 
 REST_PORT="${REST_PORT:-8080}"
 UI_PORT="${UI_PORT:-4000}"
@@ -78,15 +79,16 @@ detect_ip() {
   printf '%s' "$ip"
 }
 
-log "DSpace 9 installer - configuration"
+log "DSpace 10 installer - configuration"
 [[ -z "$EXTERNAL_IP" ]] && EXTERNAL_IP="$(detect_ip)"
 [[ -z "$EXTERNAL_IP" ]] && warn "Could not auto-detect a public IP."
 ask EXTERNAL_IP   "Public address (public IP or DNS) used in URLs" "${EXTERNAL_IP:-localhost}"
 
 ask DSPACE_VERSION  "DSpace version"        "$DSPACE_VERSION"
 ask SOLR_VERSION    "Apache Solr version"   "$SOLR_VERSION"
-ask TOMCAT_VERSION  "Apache Tomcat version" "$TOMCAT_VERSION"
-ask NODE_VERSION    "Node.js major version" "$NODE_VERSION"
+ask TOMCAT_VERSION  "Apache Tomcat version (10.1.x required)" "$TOMCAT_VERSION"
+ask MAVEN_VERSION   "Apache Maven version (3.9.x+ required)"  "$MAVEN_VERSION"
+ask NODE_VERSION    "Node.js major version (20/22/24)"        "$NODE_VERSION"
 
 ask REST_PORT       "Backend / REST API port (Tomcat)" "$REST_PORT"
 ask UI_PORT         "Frontend / UI port (PM2)"         "$UI_PORT"
@@ -110,7 +112,8 @@ cat <<SUMMARY
   ----------------------------------------------------------------
    Review configuration
   ----------------------------------------------------------------
-   DSpace ${DSPACE_VERSION}  |  Solr ${SOLR_VERSION}  |  Tomcat ${TOMCAT_VERSION}  |  Node ${NODE_VERSION}
+   DSpace ${DSPACE_VERSION}  |  Solr ${SOLR_VERSION}  |  Tomcat ${TOMCAT_VERSION}
+   Java 21 (required)  |  Maven ${MAVEN_VERSION}  |  Node ${NODE_VERSION}
    Backend URL : ${SERVER_URL}
    Frontend URL: ${UI_URL}
    Solr        : http://localhost:${SOLR_PORT}/solr   (not exposed externally)
@@ -130,6 +133,7 @@ DSPACE_HOME="$(getent passwd "$DSPACE_USER" | cut -d: -f6 || true)"
 DSPACE_HOME="${DSPACE_HOME:-/home/$DSPACE_USER}"
 SOLR_DIR="${INSTALL_ROOT}/solr"
 TOMCAT_DIR="${INSTALL_ROOT}/tomcat"
+MAVEN_DIR="${INSTALL_ROOT}/maven"
 SOLR_LIB="${SOLR_DIR}/server/solr/lib"
 run_as_dspace() { sudo -u "$DSPACE_USER" bash -lc "$1"; }
 
@@ -142,13 +146,25 @@ if [[ "$SWAP_SIZE" != "0" && ! -f /swapfile ]]; then
   grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
 fi
 
-log "Installing system dependencies (Java 17, Maven, Ant, PostgreSQL, tools)"
+log "Installing system dependencies (Java 21, Ant, PostgreSQL, tools)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y openjdk-17-jdk maven ant postgresql postgresql-contrib \
+apt-get install -y openjdk-21-jdk ant postgresql postgresql-contrib \
   libpostgresql-jdbc-java curl wget git unzip xmlstarlet ufw
 
-JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")"
+JAVA_HOME="/usr/lib/jvm/java-21-openjdk-$(dpkg --print-architecture)"
+[[ -d "$JAVA_HOME" ]] || die "JDK 21 not found at ${JAVA_HOME} (DSpace 10 requires Java 21)."
+update-alternatives --set java "${JAVA_HOME}/bin/java" >/dev/null 2>&1 || true
+update-alternatives --set javac "${JAVA_HOME}/bin/javac" >/dev/null 2>&1 || true
+
+if [[ ! -d "$MAVEN_DIR" ]]; then
+  log "Downloading Apache Maven ${MAVEN_VERSION} (DSpace 10 requires 3.9.x+; distro packages are older)"
+  wget -q -O /tmp/maven.tgz \
+    "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz"
+  tar xzf /tmp/maven.tgz -C "$INSTALL_ROOT"
+  mv "${INSTALL_ROOT}/apache-maven-${MAVEN_VERSION}" "$MAVEN_DIR"
+fi
+MVN="${MAVEN_DIR}/bin/mvn"
 
 log "Creating service user '${DSPACE_USER}' and install directories"
 id "$DSPACE_USER" &>/dev/null || useradd -m -s /bin/bash "$DSPACE_USER"
@@ -169,7 +185,7 @@ fi
 systemctl restart postgresql
 case "$PG_VER" in
   14|15|16|17) : ;;
-  *) warn "PostgreSQL ${PG_VER} is outside DSpace 9's supported range (14-17)." ;;
+  *) warn "PostgreSQL ${PG_VER} is outside DSpace 10's supported range (14-17)." ;;
 esac
 
 if [[ ! -d "$SOLR_DIR" ]]; then
@@ -215,10 +231,10 @@ setcfg "db.password"               "${DB_PASS}"
 setcfg "solr.server"               "http://localhost:${SOLR_PORT}/solr"
 setcfg "rest.cors.allowed-origins" "\${dspace.ui.url}"
 
-log "Building DSpace (mvn package) - this takes ~8-10 minutes"
-run_as_dspace "cd ~/build/${SRC} && mvn -B -q package"
+log "Building DSpace (mvn package, Java 21) - this takes ~8-10 minutes"
+run_as_dspace "export JAVA_HOME='${JAVA_HOME}'; cd ~/build/${SRC} && '${MVN}' -B -q package"
 log "Deploying DSpace (ant fresh_install)"
-run_as_dspace "cd ~/build/${SRC}/dspace/target/dspace-installer && ant -q fresh_install"
+run_as_dspace "export JAVA_HOME='${JAVA_HOME}'; cd ~/build/${SRC}/dspace/target/dspace-installer && ant -q fresh_install"
 
 log "Installing DSpace Solr cores"
 mkdir -p "${SOLR_DIR}/server/solr/configsets"
@@ -292,9 +308,9 @@ for i in $(seq 1 40); do
 done
 
 log "Running database migration"
-run_as_dspace "${DSPACE_DIR}/bin/dspace database migrate"
+run_as_dspace "export JAVA_HOME='${JAVA_HOME}'; ${DSPACE_DIR}/bin/dspace database migrate"
 log "Creating administrator ${ADMIN_EMAIL}"
-run_as_dspace "${DSPACE_DIR}/bin/dspace create-administrator \
+run_as_dspace "export JAVA_HOME='${JAVA_HOME}'; ${DSPACE_DIR}/bin/dspace create-administrator \
   -e '${ADMIN_EMAIL}' -f '${ADMIN_FIRST}' -l '${ADMIN_LAST}' -p '${ADMIN_PASS}' -c en" \
   || warn "create-administrator returned non-zero (account may already exist)."
 
