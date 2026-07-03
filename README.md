@@ -18,6 +18,10 @@ Single Bash scripts that install the complete DSpace stack (PostgreSQL, Apache S
 
 ## Usage
 
+```bash
+wget https://raw.githubusercontent.com/RideepBty/dspace-installer/main/install-dspace10.sh
+```
+
 Interactive:
 
 ```bash
