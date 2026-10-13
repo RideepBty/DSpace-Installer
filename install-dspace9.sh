@@ -144,9 +144,10 @@ fi
 
 log "Installing system dependencies (Java 17, Maven, Ant, PostgreSQL, tools)"
 export DEBIAN_FRONTEND=noninteractive
+if command -v netfilter-persistent >/dev/null 2>&1; then FW_PKG=""; else FW_PKG="ufw"; fi
 apt-get update -y
 apt-get install -y openjdk-17-jdk maven ant postgresql postgresql-contrib \
-  libpostgresql-jdbc-java curl wget git unzip xmlstarlet ufw
+  libpostgresql-jdbc-java curl wget git unzip ${FW_PKG:+"$FW_PKG"}
 
 JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")"
 
@@ -351,6 +352,21 @@ log "Configuring local UFW firewall"
 ufw allow 22/tcp   >/dev/null 2>&1 || true
 ufw allow "${REST_PORT}/tcp" >/dev/null 2>&1 || true
 ufw allow "${UI_PORT}/tcp"   >/dev/null 2>&1 || true
+UFW_STATE="$(ufw status 2>/dev/null || true)"
+INPUT_RULES="$(iptables -S INPUT 2>/dev/null || true)"
+if [[ "$UFW_STATE" != *"Status: active"* && "$INPUT_RULES" == *"-j REJECT"* ]]; then
+  echo "  iptables rejects incoming connections on this VM: opening ports ${REST_PORT} and ${UI_PORT}"
+  for p in "$REST_PORT" "$UI_PORT"; do
+    iptables -C INPUT -p tcp -m state --state NEW --dport "$p" -j ACCEPT 2>/dev/null ||
+      iptables -I INPUT 1 -p tcp -m state --state NEW --dport "$p" -j ACCEPT ||
+      warn "Could not open port $p in iptables."
+  done
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 || warn "Could not save the iptables rules; ports may close after a reboot."
+  else
+    warn "netfilter-persistent not found; ports ${REST_PORT} and ${UI_PORT} may close after a reboot."
+  fi
+fi
 
 cat <<DONE
 
