@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # record-run.sh - run a DSpace installer on a fresh Ubuntu VM and record the run.
 #
-#   sudo bash record-run.sh --label oracle-u2404-d10-r1 --provider oracle --ref v1.2.0 --script install-dspace10.sh
+#   sudo bash record-run.sh --label local-u2404-d10-r1 --ref v1.2.1 --script install-dspace10.sh
+#   sudo bash record-run.sh --label local-u2404-d10-p3 --ref main --cache    (practice run, download cache on)
 #   sudo bash record-run.sh --label rebuild-t07 --file install.sh
-#   sudo bash record-run.sh --label oracle-u2404-d10-int12 --provider oracle --ref v1.2.0 --interrupt-after 12
-#   sudo bash record-run.sh --label oracle-u2404-d10-reboot --provider oracle --check
+#   sudo bash record-run.sh --label local-u2404-d10-int12 --ref v1.2.1 --interrupt-after 12
+#   sudo bash record-run.sh --label local-u2404-d10-reboot --check
 #
 # Each run gets a folder ~/dspace-runs/<label>/ and one row in ~/dspace-runs/results.csv.
 # Test passwords are generated once per VM, kept in /root/dspace-test-secrets.env
 # (root only) and masked in the saved logs.
-# The cloud is found from its metadata service (AWS, Google Cloud, Azure, Oracle, Akamai, and IBM Cloud
-# when the VM was created with metadata on); --provider names it when that fails.
+# --cache gives the installer DOWNLOAD_CACHE=/var/cache/dspace-installer and records cache=yes;
+# it is refused for labels of reported runs, which must download everything.
+# On a cloud VM the cloud is found from its metadata service (AWS, Google Cloud, Azure, Oracle, Akamai,
+# and IBM Cloud when the VM was created with metadata on); --provider names it when that fails.
 
 set -uo pipefail
 
@@ -23,18 +26,21 @@ TOMCAT_DIR="${TOMCAT_DIR:-/opt/tomcat}"
 DSPACE_USER="${DSPACE_USER:-dspace}"
 STAGE_MARK="${STAGE_MARK:-==>}"
 SECRETS="/root/dspace-test-secrets.env"
-WRAPPER_VERSION="1.1"
+WRAPPER_VERSION="1.2"
+CACHE_DIR="${DOWNLOAD_CACHE:-/var/cache/dspace-installer}"
 
-LABEL="" REF="main" SCRIPT="install-dspace10.sh" FILE="" INTERRUPT="" CHECK_ONLY=0 NOTE="" PROVIDER_ARG=""
+LABEL="" REF="main" SCRIPT="install-dspace10.sh" FILE="" INTERRUPT="" CHECK_ONLY=0 NOTE="" PROVIDER_ARG="" CACHE=0
 
 usage() {
   cat <<'USAGE'
 Usage:
   sudo bash record-run.sh --label NAME [--provider CLOUD] [--ref TAG] [--script FILE.sh] [--note TEXT]
+  sudo bash record-run.sh --label NAME --cache                    (practice runs: use the download cache)
   sudo bash record-run.sh --label NAME --file ./install.sh        (test a local script)
   sudo bash record-run.sh --label NAME --interrupt-after MINUTES  (stop the installer on purpose)
   sudo bash record-run.sh --label NAME --check                    (checks only, e.g. after a reboot)
-Labels: letters, digits, dot, dash, underscore - e.g. oracle-u2404-d10-r1
+Labels: letters, digits, dot, dash, underscore - e.g. local-u2404-d10-r1
+--cache: the installer keeps and reuses downloads in /var/cache/dspace-installer; not for reported runs.
 --provider: the cloud's short name (oracle, ibm, akamai, aws, azure, gcp), or local.
 USAGE
   exit 2
@@ -51,6 +57,7 @@ while [[ $# -gt 0 ]]; do
     --check)           CHECK_ONLY=1; shift ;;
     --note)            NOTE="${2:-}"; shift 2 ;;
     --provider)        PROVIDER_ARG="${2:-}"; shift 2 ;;
+    --cache)           CACHE=1; shift ;;
     -h|--help)         usage ;;
     *)                 printf 'Unknown option: %s\n' "$1" >&2; usage ;;
   esac
@@ -61,6 +68,12 @@ done
 [[ -z "$INTERRUPT" || "$INTERRUPT" =~ ^[0-9]+$ ]] || die "--interrupt-after takes whole minutes"
 [[ -z "$FILE" || -f "$FILE" ]] || die "file not found: $FILE"
 [[ -z "$PROVIDER_ARG" || "$PROVIDER_ARG" =~ ^[a-z0-9-]+$ ]] || die "--provider takes a short lowercase name, e.g. oracle"
+if [[ $CACHE -eq 1 ]]; then
+  [[ -z "$FILE" && $CHECK_ONLY -eq 0 ]] || die "--cache works only when installing the repository's installers (not with --file or --check)"
+  if [[ "$LABEL" =~ -(r[0-9]+|rerun|reboot|int[0-9]*|resume)(-[0-9]+)?$ ]]; then
+    die "--cache is for practice runs; '$LABEL' is a reported-run label, and reported runs must download everything. Use a label ending in -p1, -p2 ..."
+  fi
+fi
 for c in curl python3 script timeout sha256sum; do
   command -v "$c" >/dev/null 2>&1 || die "missing command: $c"
 done
@@ -194,6 +207,16 @@ if pgrep -f 'unattended-upgrade|apt.systemd.daily|apt-get|dpkg ' >/dev/null 2>&1
 else
   APT_BUSY="no"
 fi
+# The installer's download cache: used only with --cache; its size is recorded either way.
+cache_mb() { if [[ -d "$CACHE_DIR" ]]; then du -sm "$CACHE_DIR" 2>/dev/null | cut -f1; else echo 0; fi; }
+CACHE_MB_START="$(cache_mb)"
+if [[ $CACHE -eq 1 ]]; then
+  CACHE_USED="yes" CACHE_TEXT="used: $CACHE_DIR, $CACHE_MB_START MB at start"
+elif [[ -d "$CACHE_DIR" ]]; then
+  CACHE_USED="no" CACHE_TEXT="not used ($CACHE_DIR exists, $CACHE_MB_START MB)"
+else
+  CACHE_USED="no" CACHE_TEXT="not used ($CACHE_DIR absent)"
+fi
 
 # --------------------------------------------------------------- installer
 SOURCE="" SHA="" COMMIT="" LINE_ENDINGS="unchanged"
@@ -234,6 +257,7 @@ fi
   echo "commit:          $COMMIT"
   echo "sha256:          $SHA"
   echo "line_endings:    $LINE_ENDINGS"
+  echo "download_cache:  $CACHE_TEXT"
   echo "admin_email:     $ADMIN_EMAIL"
 } > "$DIR/env.txt"
 
@@ -245,6 +269,13 @@ EXIT="" START="$(date -u +%s)"
 if [[ $CHECK_ONLY -eq 0 ]]; then
   export ASSUME_YES=1 DB_PASS ADMIN_PASS ADMIN_EMAIL
   [[ -n "${EXTERNAL_IP:-}" ]] && export EXTERNAL_IP
+  # Only --cache turns the download cache on; a DOWNLOAD_CACHE left in the environment must not leak in.
+  if [[ $CACHE -eq 1 ]]; then
+    export DOWNLOAD_CACHE="$CACHE_DIR"
+  else
+    unset DOWNLOAD_CACHE
+    [[ -d "$CACHE_DIR" ]] && printf '[record-run] note: %s exists (%s MB) but is not used without --cache.\n' "$CACHE_DIR" "$CACHE_MB_START"
+  fi
   cmd="bash '$DIR/installer.sh'"
   [[ -n "$INTERRUPT" ]] && cmd="timeout -s INT -k 60 ${INTERRUPT}m $cmd"
   printf '\n[record-run] %s: starting %s at %s UTC\n\n' "$RUN_ID" "${SOURCE}" "$(date -u +%T)"
@@ -253,6 +284,7 @@ if [[ $CHECK_ONLY -eq 0 ]]; then
   EXIT=$?
 fi
 END="$(date -u +%s)"
+CACHE_MB_END="$(cache_mb)"
 
 # ------------------------------------------------------------------ checks
 code() { curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$1" 2>/dev/null; }
@@ -372,7 +404,8 @@ RR_ROW="$(python3 -c 'import json,sys; print(json.dumps(dict(zip(sys.argv[1::2],
   solr_cores "$SOLR_CORES" solr_search "$SOLR_SEARCH" svc_postgresql "$SVC_PG" svc_solr "$SVC_SOLR" \
   svc_tomcat "$SVC_TOMCAT" svc_pm2 "$SVC_PM2" uriencoding_count "$URIENC" nested_webapp "$NESTED" \
   oom_kills "$OOM" disk_used_gb "$DISK_USED" java "$JAVA_V" node "$NODE_V" dspace "$DSPACE_V" \
-  pass "$PASS" note "$NOTE" wrapper_version "$WRAPPER_VERSION")"
+  pass "$PASS" note "$NOTE" wrapper_version "$WRAPPER_VERSION" \
+  cache "$CACHE_USED" cache_mb_at_start "$CACHE_MB_START" cache_mb_at_end "$CACHE_MB_END")"
 
 python3 - <<'PY'
 import bisect, csv, json, os, re
@@ -436,10 +469,21 @@ cols = ["run_id", "label", "kind", "pass", "date_utc", "start_utc", "end_utc", "
         "sha256", "api_local", "api_public", "public_ip", "rest_url", "url_source", "rest_url_localhost",
         "ui_local", "ui_public", "login", "solr_cores", "solr_search",
         "svc_postgresql", "svc_solr", "svc_tomcat", "svc_pm2", "uriencoding_count", "nested_webapp",
-        "oom_kills", "disk_used_gb", "java", "node", "dspace", "note", "wrapper_version"]
+        "oom_kills", "disk_used_gb", "java", "node", "dspace", "note", "wrapper_version",
+        "cache", "cache_mb_at_start", "cache_mb_at_end"]
 json.dump(row, open(os.path.join(d, "result.json"), "w"), indent=2)
 results = os.path.join(os.path.dirname(d), "results.csv")
 new = not os.path.exists(results)
+if not new:
+    # A results.csv started by an older wrapper gets the current columns, so no value lands in the wrong one.
+    with open(results, newline="") as f:
+        reader = csv.DictReader(f)
+        old_cols, old_rows = reader.fieldnames or [], list(reader)
+    if old_cols != cols:
+        with open(results, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(old_rows)
 with open(results, "a", newline="") as f:
     w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
     if new:
@@ -451,7 +495,7 @@ chown -R "$OWNER": "$RUNS" 2>/dev/null || true
 
 cat <<EOF
 
-[record-run] ${RUN_ID}: kind=${KIND} exit=${EXIT:-n/a} pass=${PASS}
+[record-run] ${RUN_ID}: kind=${KIND} exit=${EXIT:-n/a} pass=${PASS} cache=${CACHE_USED}
              API ${API_LOCAL} (public ${API_PUBLIC:-n/a})  UI ${UI_LOCAL}  login ${LOGIN}  Solr cores ${SOLR_CORES}
              saved in ${DIR}
 EOF

@@ -5,6 +5,9 @@ Usage:
     python3 summarize-results.py FOLDER [--matrix test-matrix.csv] [--out summary.md]
 
 FOLDER is searched for every results.csv (for example one copied back from each VM).
+Reported runs: with --matrix, the labels the matrix marks reported=yes, on any machine; without it,
+every run except practice runs (labels ending -p1, -p2 ...) and AI-rebuild runs (labels starting
+"rebuild"). A run that used the download cache (cache=yes) is never reported.
 The summary is printed as Markdown and also saved to --out (default: FOLDER/summary.md).
 """
 import argparse
@@ -17,10 +20,10 @@ from collections import defaultdict
 CHECKS = [("exit_code", "0", "exit"), ("api_local", "200", "API"), ("api_public", "200", "public API"),
           ("rest_url_localhost", "no", "localhost URL"), ("ui_local", "200", "UI"), ("login", "200", "login"),
           ("solr_search", "yes", "Solr")]
-CLOUDS = {"oracle": "Oracle Cloud", "ibm": "IBM Cloud", "akamai": "Akamai",
-          "aws": "AWS", "azure": "Azure", "gcp": "Google Cloud"}
+MACHINES = {"local": "Local VM", "oracle": "Oracle Cloud", "ibm": "IBM Cloud", "akamai": "Akamai",
+            "aws": "AWS", "azure": "Azure", "gcp": "Google Cloud"}
 ROBUST = re.compile(r"-(rerun|int\d*|resume|reboot)(-\d+)?$")
-REPEAT = re.compile(r"-r\d+(-\d+)?$")
+FRESH = re.compile(r"-r\d+(-\d+)?$")
 PRACTICE = re.compile(r"-p\d+(-\d+)?$")
 
 
@@ -37,7 +40,17 @@ def load(folder):
                 seen.add(key)
                 r["_dir"] = os.path.join(root, r.get("run_id", ""))
                 rows.append(r)
-    return rows
+    return sorted(rows, key=lambda r: (r.get("date_utc", ""), r.get("start_utc", "")))  # oldest first
+
+
+def used_cache(r):
+    """Rows from wrappers before 1.2 have no cache column: the download cache did not exist then."""
+    return (r.get("cache") or "").strip().lower() == "yes"
+
+
+def machine(r):
+    p = r.get("provider", "")
+    return MACHINES.get(p, p or "?")
 
 
 def installer(r):
@@ -62,7 +75,7 @@ def minutes(r):
 
 
 def vm_type(r):
-    """The cloud's VM type, or vCPUs and RAM when the metadata service gave no type."""
+    """The cloud's VM type, or vCPUs and RAM when there is none (local VMs)."""
     return r.get("instance_type") or f"{r.get('vcpus', '?')} vCPU, {r.get('ram_gb', '?')} GB"
 
 
@@ -90,54 +103,72 @@ def main():
     rows = load(a.folder)
     if not rows:
         raise SystemExit(f"No results.csv found under {a.folder}")
-    out = []
-    rebuild = [r for r in rows if r.get("label", "").startswith("rebuild")]
-    cloud = [r for r in rows if r.get("provider") in CLOUDS and r not in rebuild
-             and not PRACTICE.search(r.get("label", ""))]
-    other = [r for r in rows if r not in cloud and r not in rebuild]
-    installs = [r for r in cloud if r.get("kind") == "install"]
-    passed = [r for r in installs if r.get("pass") == "yes"]
-    out.append(f"# Test-run summary\n\nCloud: {len(cloud)} recorded runs, of which {len(installs)} full installs "
-               f"and {len(passed)} passed all checks. Practice runs ({len(other)}) and AI-rebuild runs "
-               f"({len(rebuild)}) are listed separately at the end.")
 
-    # 1. The reported matrix: cloud installs labelled -r1, -r2, ...
+    planned = None
+    if a.matrix:
+        with open(a.matrix, newline="", encoding="utf-8") as f:
+            planned = [m for m in csv.DictReader(f) if m.get("reported", "yes") == "yes"]
+    planned_labels = {m["label"] for m in planned} if planned is not None else None
+
+    rebuild = [r for r in rows if r.get("label", "").startswith("rebuild")]
+
+    def reportable(r):
+        label = r.get("label", "")
+        if label.startswith("rebuild"):
+            return False
+        return label in planned_labels if planned_labels is not None else not PRACTICE.search(label)
+
+    cached_out = [r for r in rows if reportable(r) and used_cache(r)]
+    reported = [r for r in rows if reportable(r) and not used_cache(r)]
+    other = [r for r in rows if r not in reported and r not in rebuild]
+    installs = [r for r in reported if r.get("kind") == "install"]
+    fresh = [r for r in installs if FRESH.search(r.get("label", ""))]
+    passed = [r for r in installs if r.get("pass") == "yes"]
+
+    out = [f"# Test-run summary\n\nReported runs: {len(reported)}, of which {len(installs)} full installs; "
+           f"{len(passed)} passed all checks. Practice and other runs ({len(other)}) and AI-rebuild runs "
+           f"({len(rebuild)}) are listed separately at the end."]
+    if cached_out:
+        out.append("\nLeft out of the reported tables because they used the download cache: "
+                   + ", ".join(r["run_id"] for r in cached_out)
+                   + ". Repeat them on the clean snapshot without --cache.")
+
+    # 1. Fresh installs (labels ending -r1, -r2 ...) by machine, Ubuntu release and installer
     groups = defaultdict(list)
-    for r in installs:
-        if r.get("provider") in CLOUDS and REPEAT.search(r.get("label", "")):
-            groups[(CLOUDS[r["provider"]], ubuntu(r), installer(r))].append(r)
+    for r in fresh:
+        groups[(machine(r), ubuntu(r), installer(r))].append(r)
     body = []
     for key in sorted(groups):
         g = groups[key]
         ok = [r for r in g if r.get("pass") == "yes"]
         mins = [m for m in (minutes(r) for r in ok) if m is not None]
         rng = f"{fmt(min(mins))}-{fmt(max(mins))}" if mins else ""
-        itypes = ", ".join(sorted({vm_type(r) for r in g}))
-        body.append([*key, itypes, len(g), len(ok), fmt(statistics.median(mins)) if mins else "", rng])
-    out.append("\n## Results by cloud, Ubuntu release and installer\n\n" + (table(
-        ["Cloud", "Ubuntu", "Installer", "VM type", "Runs", "Passed", "Median minutes", "Range"], body)
-        if body else "No cloud runs labelled -r1, -r2 ... yet."))
+        sizes = ", ".join(sorted({vm_type(r) for r in g}))
+        body.append([*key, sizes, len(g), len(ok), fmt(statistics.median(mins)) if mins else "", rng])
+    out.append("\n## Results by machine, Ubuntu release and installer\n\n" + (table(
+        ["Machine", "Ubuntu", "Installer", "VM size", "Runs", "Passed", "Median minutes", "Range"], body)
+        if body else "No reported fresh installs (labels ending -r1, -r2 ...) yet."))
 
-    # 2. Failed full installs
+    # 2. Failed installs
     fails = [r for r in installs if r.get("pass") != "yes"]
-    out.append("\n## Failed cloud installs\n\n" + (table(
-        ["Run", "Exit code", "Last installer step", "Checks not passed", "Note"],
-        [[r["run_id"], r.get("exit_code", ""), r.get("last_stage", ""), failed_checks(r), r.get("note", "")]
-         for r in fails]) if fails else "None."))
+    out.append("\n## Failed installs\n\n" + (table(
+        ["Run", "Date", "Exit code", "Last installer step", "Checks not passed", "Note"],
+        [[r["run_id"], r.get("date_utc", ""), r.get("exit_code", ""), r.get("last_stage", ""),
+          failed_checks(r), r.get("note", "")] for r in fails]) if fails else "None."))
 
     # 3. Robustness: re-run, interrupted, resumed and post-reboot runs
-    rob = [r for r in cloud if ROBUST.search(r.get("label", ""))]
+    rob = [r for r in reported if ROBUST.search(r.get("label", ""))]
     out.append("\n## Re-run, interruption and reboot tests\n\n" + (table(
         ["Run", "Kind", "Passed", "Exit code", "URIEncoding count", "Nested webapp", "Checks not passed"],
         [[r["run_id"], r.get("kind", ""), r.get("pass", ""), r.get("exit_code", ""),
           r.get("uriencoding_count", ""), r.get("nested_webapp", ""),
           "" if r.get("kind") == "interrupted" else failed_checks(r)] for r in rob]) if rob else "None yet."))
 
-    # 4. Time per installer step (passing cloud installs)
+    # 4. Time per installer step (passing fresh installs only: re-runs and resumes skip steps)
     per_stage = defaultdict(list)
     order = {}
-    for r in passed:
-        if r.get("provider") not in CLOUDS:
+    for r in fresh:
+        if r.get("pass") != "yes":
             continue
         path = os.path.join(r["_dir"], "stages.csv")
         if not os.path.exists(path):
@@ -150,24 +181,23 @@ def main():
     if per_stage:
         body = [[k[0], k[1], len(v), f"{statistics.median(v):.1f}", f"{max(v):.1f}"]
                 for k, v in sorted(per_stage.items(), key=lambda kv: (kv[0][0], order[kv[0]]))]
-        out.append("\n## Minutes per installer step (passing cloud installs)\n\n" +
+        out.append("\n## Minutes per installer step (passing fresh installs)\n\n" +
                    table(["Installer", "Step", "Runs", "Median", "Max"], body))
 
-    # 5. Practice runs (local VMs, and -p1 runs on each cloud) and AI-rebuild runs, kept apart from the reported runs
-    for title, group in (("Practice runs", other), ("AI-rebuild runs", rebuild)):
+    # 5. Practice and other runs, and AI-rebuild runs, kept apart from the reported runs
+    for title, group in (("Practice and other runs", other), ("AI-rebuild runs", rebuild)):
         if group:
             out.append(f"\n## {title}\n\n" + table(
-                ["Run", "Kind", "Passed", "Minutes", "Exit code", "Last installer step", "Checks not passed"],
-                [[r["run_id"], r.get("kind", ""), r.get("pass", ""), r.get("minutes", ""), r.get("exit_code", ""),
-                  r.get("last_stage", ""), "" if r.get("kind") == "interrupted" else failed_checks(r)]
-                 for r in group]))
+                ["Run", "Date", "Kind", "Cache", "Passed", "Minutes", "Exit code", "Last installer step",
+                 "Checks not passed"],
+                [[r["run_id"], r.get("date_utc", ""), r.get("kind", ""), r.get("cache") or "no", r.get("pass", ""),
+                  r.get("minutes", ""), r.get("exit_code", ""), r.get("last_stage", ""),
+                  "" if r.get("kind") == "interrupted" else failed_checks(r)] for r in group]))
 
-    # 6. Matrix coverage
-    if a.matrix:
-        with open(a.matrix, newline="", encoding="utf-8") as f:
-            planned = [m for m in csv.DictReader(f) if m.get("reported", "yes") == "yes"]
-        done = {r.get("label") for r in rows}
-        ok = {r.get("label") for r in rows if r.get("pass") == "yes" or r.get("kind") == "interrupted"}
+    # 6. Matrix coverage (only runs that count as reported)
+    if planned is not None:
+        done = {r.get("label") for r in reported}
+        ok = {r.get("label") for r in reported if r.get("pass") == "yes" or r.get("kind") == "interrupted"}
         missing = [m["label"] for m in planned if m["label"] not in done]
         retry = [m["label"] for m in planned if m["label"] in done and m["label"] not in ok]
         out.append(f"\n## Matrix coverage\n\n{len(planned) - len(missing)} of {len(planned)} planned runs "

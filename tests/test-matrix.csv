@@ -1,51 +1,13 @@
 label,where,ubuntu,installer,test,reported,how
-oracle-u2204-d9-r1,Oracle Cloud,22.04,install-dspace9.sh,repeat 1,yes,fresh VM
-oracle-u2204-d9-r2,Oracle Cloud,22.04,install-dspace9.sh,repeat 2,yes,fresh VM
-oracle-u2204-d9-r3,Oracle Cloud,22.04,install-dspace9.sh,repeat 3,yes,fresh VM
-oracle-u2204-d10-r1,Oracle Cloud,22.04,install-dspace10.sh,repeat 1,yes,fresh VM
-oracle-u2204-d10-r2,Oracle Cloud,22.04,install-dspace10.sh,repeat 2,yes,fresh VM
-oracle-u2204-d10-r3,Oracle Cloud,22.04,install-dspace10.sh,repeat 3,yes,fresh VM
-oracle-u2404-d9-r1,Oracle Cloud,24.04,install-dspace9.sh,repeat 1,yes,fresh VM
-oracle-u2404-d9-r2,Oracle Cloud,24.04,install-dspace9.sh,repeat 2,yes,fresh VM
-oracle-u2404-d9-r3,Oracle Cloud,24.04,install-dspace9.sh,repeat 3,yes,fresh VM
-oracle-u2404-d10-r1,Oracle Cloud,24.04,install-dspace10.sh,repeat 1,yes,fresh VM
-oracle-u2404-d10-r2,Oracle Cloud,24.04,install-dspace10.sh,repeat 2,yes,fresh VM
-oracle-u2404-d10-r3,Oracle Cloud,24.04,install-dspace10.sh,repeat 3,yes,fresh VM
-ibm-u2204-d9-r1,IBM Cloud,22.04,install-dspace9.sh,repeat 1,yes,fresh VM
-ibm-u2204-d9-r2,IBM Cloud,22.04,install-dspace9.sh,repeat 2,yes,fresh VM
-ibm-u2204-d9-r3,IBM Cloud,22.04,install-dspace9.sh,repeat 3,yes,fresh VM
-ibm-u2204-d10-r1,IBM Cloud,22.04,install-dspace10.sh,repeat 1,yes,fresh VM
-ibm-u2204-d10-r2,IBM Cloud,22.04,install-dspace10.sh,repeat 2,yes,fresh VM
-ibm-u2204-d10-r3,IBM Cloud,22.04,install-dspace10.sh,repeat 3,yes,fresh VM
-ibm-u2404-d9-r1,IBM Cloud,24.04,install-dspace9.sh,repeat 1,yes,fresh VM
-ibm-u2404-d9-r2,IBM Cloud,24.04,install-dspace9.sh,repeat 2,yes,fresh VM
-ibm-u2404-d9-r3,IBM Cloud,24.04,install-dspace9.sh,repeat 3,yes,fresh VM
-ibm-u2404-d10-r1,IBM Cloud,24.04,install-dspace10.sh,repeat 1,yes,fresh VM
-ibm-u2404-d10-r2,IBM Cloud,24.04,install-dspace10.sh,repeat 2,yes,fresh VM
-ibm-u2404-d10-r3,IBM Cloud,24.04,install-dspace10.sh,repeat 3,yes,fresh VM
-akamai-u2204-d9-r1,Akamai,22.04,install-dspace9.sh,repeat 1,yes,fresh VM
-akamai-u2204-d9-r2,Akamai,22.04,install-dspace9.sh,repeat 2,yes,fresh VM
-akamai-u2204-d9-r3,Akamai,22.04,install-dspace9.sh,repeat 3,yes,fresh VM
-akamai-u2204-d10-r1,Akamai,22.04,install-dspace10.sh,repeat 1,yes,fresh VM
-akamai-u2204-d10-r2,Akamai,22.04,install-dspace10.sh,repeat 2,yes,fresh VM
-akamai-u2204-d10-r3,Akamai,22.04,install-dspace10.sh,repeat 3,yes,fresh VM
-akamai-u2404-d9-r1,Akamai,24.04,install-dspace9.sh,repeat 1,yes,fresh VM
-akamai-u2404-d9-r2,Akamai,24.04,install-dspace9.sh,repeat 2,yes,fresh VM
-akamai-u2404-d9-r3,Akamai,24.04,install-dspace9.sh,repeat 3,yes,fresh VM
-akamai-u2404-d10-r1,Akamai,24.04,install-dspace10.sh,repeat 1,yes,fresh VM
-akamai-u2404-d10-r2,Akamai,24.04,install-dspace10.sh,repeat 2,yes,fresh VM
-akamai-u2404-d10-r3,Akamai,24.04,install-dspace10.sh,repeat 3,yes,fresh VM
-oracle-u2404-d10-rerun,Oracle Cloud,24.04,install-dspace10.sh,re-run,yes,"same VM as oracle-u2404-d10-r1, after it passed"
-oracle-u2404-d10-reboot,Oracle Cloud,24.04,install-dspace10.sh,reboot check,yes,"same VM: sudo reboot, then --check"
-oracle-u2404-d10-int12,Oracle Cloud,24.04,install-dspace10.sh,interrupted,yes,"fresh VM, --interrupt-after 12"
-oracle-u2404-d10-resume,Oracle Cloud,24.04,install-dspace10.sh,resume,yes,"same VM as -int12, run again"
-oracle-u2404-d10-p1,Oracle Cloud,24.04,install-dspace10.sh,cloud practice,no,"--ref main, before tagging v1.2.0"
-ibm-u2404-d10-p1,IBM Cloud,24.04,install-dspace10.sh,cloud practice,no,"--ref main, before tagging v1.2.0"
-akamai-u2404-d10-p1,Akamai,24.04,install-dspace10.sh,cloud practice,no,"--ref main, before tagging v1.2.0"
-local-u2404-d10-p1,Local VM,24.04,install-dspace10.sh,practice,no,first rehearsal
-local-u2404-d10-rerun,Local VM,24.04,install-dspace10.sh,re-run,no,"same VM, after p1 passed"
-local-u2404-d10-reboot,Local VM,24.04,install-dspace10.sh,reboot check,no,"same VM: reboot, then --check"
-local-u2404-d10-int12,Local VM,24.04,install-dspace10.sh,interrupted,no,"clean snapshot, --interrupt-after 12"
-local-u2404-d10-resume,Local VM,24.04,install-dspace10.sh,resume,no,"same VM, run again"
-local-u2204-d10-p1,Local VM,22.04,install-dspace10.sh,practice,no,clean snapshot
-local-u2404-d9-p1,Local VM,24.04,install-dspace9.sh,practice,no,clean snapshot
+local-u2404-d10-r1,Local VM,24.04,install-dspace10.sh,fresh install,yes,"clean snapshot, --ref v1.2.1, no --cache"
+local-u2404-d10-rerun,Local VM,24.04,install-dspace10.sh,re-run,yes,"same VM as local-u2404-d10-r1, after it passed"
+local-u2404-d10-reboot,Local VM,24.04,install-dspace10.sh,reboot check,yes,"same VM: sudo reboot, then --check"
+local-u2404-d10-int12,Local VM,24.04,install-dspace10.sh,interrupted,yes,"clean snapshot, --interrupt-after 12"
+local-u2404-d10-resume,Local VM,24.04,install-dspace10.sh,resume,yes,"same VM as -int12, run again"
+local-u2404-d9-r1,Local VM,24.04,install-dspace9.sh,fresh install,yes,"clean snapshot, --ref v1.2.1, no --cache"
+local-u2204-d10-r1,Local VM,22.04,install-dspace10.sh,fresh install,yes,"clean snapshot, --ref v1.2.1, no --cache"
+local-u2204-d9-r1,Local VM,22.04,install-dspace9.sh,fresh install,yes,"clean snapshot, --ref v1.2.1, no --cache"
+local-u2404-d10-p1,Local VM,24.04,install-dspace10.sh,practice,no,"--ref main on 13 Oct 2026, before the v1.2.0 changes"
+local-u2404-d10-p2,Local VM,24.04,install-dspace10.sh,practice,no,"clean snapshot, --ref main --cache (fills the download cache)"
+local-u2404-d9-p1,Local VM,24.04,install-dspace9.sh,practice,no,"clean snapshot plus the saved cache, --ref main --cache"
+local-u2204-d10-p1,Local VM,22.04,install-dspace10.sh,practice,no,"warm snapshot, --ref main --cache"

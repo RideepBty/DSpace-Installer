@@ -4,9 +4,106 @@ set -euo pipefail
 
 [[ $EUID -ne 0 ]] && { echo "ERROR: run with sudo: sudo bash $0" >&2; exit 1; }
 
+# Keep a copy of everything the installer prints, so a failed install can be diagnosed later.
+INSTALL_LOG="${INSTALL_LOG:-/var/log/dspace-installer.log}"
+touch "$INSTALL_LOG" && chmod 600 "$INSTALL_LOG"
+printf '\n===== %s: %s started\n' "$(date -u +%FT%TZ)" "$(basename "$0")" >> "$INSTALL_LOG"
+exec > >(tee -a "$INSTALL_LOG") 2>&1
+on_exit() {
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    printf '\n[error] The installer stopped (exit code %s). Its full output is in %s\n' "$rc" "$INSTALL_LOG"
+  fi
+}
+trap on_exit EXIT
+
 log()  { printf '\n\033[1;34m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Optional download cache: with DOWNLOAD_CACHE set (e.g. /var/cache/dspace-installer), everything this
+# installer downloads is also saved there, and later runs take it from there instead of the internet.
+cache_put() {  # cache_put <file> <path in the cache>: copy, then rename, so a stopped run never leaves half a file
+  mkdir -p "$(dirname "$2")" || return 1
+  if cp "$1" "$2.part" && mv -f "$2.part" "$2"; then return 0; fi
+  rm -f "$2.part"
+  return 1
+}
+file_ok() {  # a .tar.gz or .tgz file must pass gzip's test; any other file must not be empty
+  case "$1" in
+    *.tar.gz|*.tgz) gzip -t "$1" 2>/dev/null ;;
+    *) [[ -s "$1" ]] ;;
+  esac
+}
+
+# Download an Apache release file (Apache's CDN first, then its archive) and check its SHA-512.
+# With the download cache on, a cached copy is used when it matches the checksum.
+apache_get() {  # apache_get <path under dist/> <output file>
+  local path="$1" out="$2" want="" base got cached=""
+  [[ -n "${DOWNLOAD_CACHE:-}" ]] && cached="${DOWNLOAD_CACHE}/apache/${path}"
+  if [[ -n "$cached" && -f "${cached}.sha512" ]]; then
+    want="$(tr -d '[:space:]' < "${cached}.sha512" | grep -oiE '[0-9a-f]{128}' | head -1 || true)"
+  fi
+  if [[ -z "$want" ]]; then
+    for base in https://downloads.apache.org https://archive.apache.org/dist; do
+      want="$(curl -fsSL --max-time 60 "${base}/${path}.sha512" 2>/dev/null | tr -d '[:space:]' | grep -oiE '[0-9a-f]{128}' | head -1 || true)"
+      [[ -n "$want" ]] && break
+    done
+  fi
+  [[ -n "$want" ]] || die "No SHA-512 checksum found for ${path}"
+  want="${want,,}"
+  if [[ -n "$cached" && -f "$cached" && "$(sha512sum "$cached" | awk '{print $1}')" == "$want" ]]; then
+    echo "  Taking ${path##*/} from the download cache (SHA-512 checked)"
+    cp "$cached" "$out" || die "Could not copy ${cached} to ${out}"
+    return 0
+  fi
+  for base in https://dlcdn.apache.org https://archive.apache.org/dist; do
+    if wget -q --show-progress --progress=dot:giga --timeout=60 --tries=3 -O "$out" "${base}/${path}"; then
+      got="$(sha512sum "$out" | awk '{print $1}')"
+      if [[ "$want" == "$got" ]]; then
+        if [[ -n "$cached" ]]; then
+          if cache_put "$out" "$cached" && printf '%s\n' "$want" > "${cached}.sha512"; then
+            echo "  Saved a copy in the download cache"
+          else
+            warn "Could not save ${path##*/} in the download cache."
+          fi
+        fi
+        return 0
+      fi
+      warn "Checksum mismatch for ${path} from ${base}; trying the next source."
+    else
+      warn "Download from ${base} failed; trying the next source."
+    fi
+    rm -f "$out"
+  done
+  die "Could not download a verified copy of ${path}"
+}
+
+# Download a file that has no published checksum (GitHub source archives, Maven Central jars),
+# or take the copy an earlier run saved in the download cache.
+cached_get() {  # cached_get <url> <output file>
+  local url="$1" out="$2" cached=""
+  if [[ -n "${DOWNLOAD_CACHE:-}" ]]; then
+    cached="${DOWNLOAD_CACHE}/files/${url#*://}"
+    if [[ -s "$cached" ]] && file_ok "$cached"; then
+      echo "  Taking ${url##*/} ($(cut -d/ -f1-3 <<< "${url#*://}")) from the download cache"
+      cp "$cached" "$out" || return 1
+      return 0
+    fi
+  fi
+  if ! { wget -q -O "$out" "$url" && file_ok "$out"; }; then
+    rm -f "$out"
+    return 1
+  fi
+  if [[ -n "$cached" ]]; then
+    if cache_put "$out" "$cached"; then
+      echo "  Saved a copy in the download cache"
+    else
+      warn "Could not save ${url##*/} in the download cache."
+    fi
+  fi
+  return 0
+}
 
 ASSUME_YES="${ASSUME_YES:-0}"
 
@@ -35,6 +132,8 @@ ADMIN_PASS="${ADMIN_PASS:-}"
 SWAP_SIZE="${SWAP_SIZE:-4G}"
 NODE_HEAP_MB="${NODE_HEAP_MB:-4096}"
 EXTERNAL_IP="${EXTERNAL_IP:-}"
+CREDENTIALS_FILE="${CREDENTIALS_FILE:-/root/dspace-credentials.txt}"
+DOWNLOAD_CACHE="${DOWNLOAD_CACHE:-}"
 
 ask() {
   local var="$1" prompt="$2" def="$3" val
@@ -44,11 +143,21 @@ ask() {
   printf -v "$var" '%s' "${val:-$def}"
 }
 ask_secret() {
-  local var="$1" prompt="$2" val val2
+  local var="$1" prompt="$2" val="" val2
   [[ -n "${!var:-}" ]] && return
   if [[ "$ASSUME_YES" == "1" ]]; then
-    printf -v "$var" '%s' "$(openssl rand -base64 12)"
-    warn "$var not set; generated a random value."; return
+    # A re-run reuses the value an earlier run generated, so it still matches the database and the admin account.
+    [[ -r "$CREDENTIALS_FILE" ]] && val="$(sed -n "s/^${var}=//p" "$CREDENTIALS_FILE" | tail -n 1)"
+    if [[ -n "$val" ]]; then
+      printf -v "$var" '%s' "$val"
+      warn "$var not set; reusing the value saved in ${CREDENTIALS_FILE}."
+    else
+      printf -v "$var" '%s' "$(openssl rand -base64 12)"
+      GENERATED_SECRETS=1
+      warn "$var not set; generated a random value."
+    fi
+    SAVED_SECRETS=1
+    return
   fi
   while :; do
     read -rsp "  $prompt: " val; echo
@@ -78,10 +187,40 @@ detect_ip() {
   printf '%s' "$ip"
 }
 
+# The download cache also keeps the apt packages: apt-get is pointed at a folder inside it.
+APT_CACHE=()
+if [[ -n "$DOWNLOAD_CACHE" ]]; then
+  [[ "$DOWNLOAD_CACHE" =~ ^/[A-Za-z0-9._/-]+$ ]] || \
+    die "DOWNLOAD_CACHE must be a full path made of letters, digits and . _ - / (for example /var/cache/dspace-installer)."
+  mkdir -p "${DOWNLOAD_CACHE}/apt/partial"
+  chown _apt:root "${DOWNLOAD_CACHE}/apt/partial" 2>/dev/null && chmod 700 "${DOWNLOAD_CACHE}/apt/partial" || true
+  APT_CACHE=(-o "Dir::Cache::Archives=${DOWNLOAD_CACHE}/apt/")
+fi
+
+# Minimal Ubuntu images leave out curl, which the address detection below needs.
+if ! command -v curl >/dev/null 2>&1; then
+  log "Installing curl (needed to find the public address)"
+  DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null
+  DEBIAN_FRONTEND=noninteractive apt-get "${APT_CACHE[@]}" install -y curl >/dev/null
+fi
+
 log "DSpace 9 installer - configuration"
-[[ -z "$EXTERNAL_IP" ]] && EXTERNAL_IP="$(detect_ip)"
-[[ -z "$EXTERNAL_IP" ]] && warn "Could not auto-detect a public IP."
-ask EXTERNAL_IP   "Public address (public IP or DNS) used in URLs" "${EXTERNAL_IP:-localhost}"
+if [[ -z "$EXTERNAL_IP" ]]; then
+  DETECTED_IP="$(detect_ip)"
+  [[ -z "$DETECTED_IP" ]] && warn "Could not auto-detect a public IP."
+  if [[ "$ASSUME_YES" == "1" ]]; then
+    EXTERNAL_IP="${DETECTED_IP:-localhost}"
+  else
+    # Ask even when detection worked: on a local VM or behind NAT the detected address can be the wrong one.
+    [[ -n "$DETECTED_IP" ]] && echo "  Detected public address: ${DETECTED_IP}. Press Enter to use it, or type the right one."
+    while :; do
+      read -rp "  Public address (public IP or DNS) used in URLs [${DETECTED_IP:-localhost}]: " EXTERNAL_IP
+      EXTERNAL_IP="${EXTERNAL_IP:-${DETECTED_IP:-localhost}}"
+      [[ "$EXTERNAL_IP" =~ ^[A-Za-z0-9.-]+$ ]] && break
+      echo "  -> type only the address, e.g. 203.0.113.10 or repo.example.org (no http://, port or spaces)."
+    done
+  fi
+fi
 
 ask DSPACE_VERSION  "DSpace version"        "$DSPACE_VERSION"
 ask SOLR_VERSION    "Apache Solr version"   "$SOLR_VERSION"
@@ -104,6 +243,9 @@ ask_secret ADMIN_PASS "DSpace admin password"
 
 SERVER_URL="http://${EXTERNAL_IP}:${REST_PORT}/server"
 UI_URL="http://${EXTERNAL_IP}:${UI_PORT}"
+cache_size() { du -sh "$DOWNLOAD_CACHE" 2>/dev/null | cut -f1 || true; }
+CACHE_LINE=""
+[[ -n "$DOWNLOAD_CACHE" ]] && CACHE_LINE=$'\n'"   Download cache: ${DOWNLOAD_CACHE} ($(cache_size) saved so far)"
 
 cat <<SUMMARY
 
@@ -117,13 +259,21 @@ cat <<SUMMARY
    Service user: ${DSPACE_USER}        Install dir: ${DSPACE_DIR}
    Database    : ${DB_NAME} / ${DB_USER}
    Admin login : ${ADMIN_EMAIL}
-   Swap        : ${SWAP_SIZE}     Node build heap: ${NODE_HEAP_MB} MB
+   Swap        : ${SWAP_SIZE}     Node build heap: ${NODE_HEAP_MB} MB${CACHE_LINE}
   ----------------------------------------------------------------
 SUMMARY
 
 if [[ "$ASSUME_YES" != "1" ]]; then
   read -rp "  Proceed with installation? [y/N]: " ok
   [[ "${ok,,}" == "y" ]] || die "Aborted by user."
+fi
+
+# Save generated passwords before anything is installed, so they survive a failed run.
+if [[ "${GENERATED_SECRETS:-0}" == "1" ]]; then
+  ( umask 077
+    printf '# DSpace installer: passwords for this server. A re-run reads this file; keep it.\nADMIN_EMAIL=%s\nADMIN_PASS=%s\nDB_PASS=%s\n' \
+      "$ADMIN_EMAIL" "$ADMIN_PASS" "$DB_PASS" > "$CREDENTIALS_FILE" )
+  chmod 600 "$CREDENTIALS_FILE"
 fi
 
 DSPACE_HOME="$(getent passwd "$DSPACE_USER" | cut -d: -f6 || true)"
@@ -146,7 +296,7 @@ log "Installing system dependencies (Java 17, Maven, Ant, PostgreSQL, tools)"
 export DEBIAN_FRONTEND=noninteractive
 if command -v netfilter-persistent >/dev/null 2>&1; then FW_PKG=""; else FW_PKG="ufw"; fi
 apt-get update -y
-apt-get install -y openjdk-17-jdk maven ant postgresql postgresql-contrib \
+apt-get "${APT_CACHE[@]}" install -y openjdk-17-jdk maven ant postgresql postgresql-contrib \
   libpostgresql-jdbc-java curl wget git unzip ${FW_PKG:+"$FW_PKG"}
 
 JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")"
@@ -155,6 +305,19 @@ log "Creating service user '${DSPACE_USER}' and install directories"
 id "$DSPACE_USER" &>/dev/null || useradd -m -s /bin/bash "$DSPACE_USER"
 mkdir -p "$DSPACE_DIR"
 chown "$DSPACE_USER:$DSPACE_USER" "$DSPACE_DIR"
+
+# Maven, npm and nvm run as the service user, so their parts of the download cache belong to it.
+MVN_CACHE="" NPM_CACHE=""
+if [[ -n "$DOWNLOAD_CACHE" ]]; then
+  for d in maven npm nvm; do
+    mkdir -p "${DOWNLOAD_CACHE}/${d}"
+    chown -R "$DSPACE_USER:$DSPACE_USER" "${DOWNLOAD_CACHE}/${d}" || warn "Could not hand ${DOWNLOAD_CACHE}/${d} to ${DSPACE_USER}."
+    sudo -u "$DSPACE_USER" test -w "${DOWNLOAD_CACHE}/${d}" || \
+      die "The '${DSPACE_USER}' user cannot write to ${DOWNLOAD_CACHE}/${d}; use a folder it can reach, such as /var/cache/dspace-installer."
+  done
+  MVN_CACHE=" -Dmaven.repo.local='${DOWNLOAD_CACHE}/maven'"
+  NPM_CACHE="export npm_config_cache='${DOWNLOAD_CACHE}/npm' npm_config_prefer_offline=true; "
+fi
 
 log "Configuring PostgreSQL role '${DB_USER}' and database '${DB_NAME}'"
 sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" | grep -q 1 || \
@@ -175,8 +338,7 @@ esac
 
 if [[ ! -d "$SOLR_DIR" ]]; then
   log "Downloading Apache Solr ${SOLR_VERSION}"
-  wget -q -O "/tmp/solr-${SOLR_VERSION}.tgz" \
-    "https://archive.apache.org/dist/solr/solr/${SOLR_VERSION}/solr-${SOLR_VERSION}.tgz"
+  apache_get "solr/solr/${SOLR_VERSION}/solr-${SOLR_VERSION}.tgz" "/tmp/solr-${SOLR_VERSION}.tgz"
   tar xzf "/tmp/solr-${SOLR_VERSION}.tgz" -C "$INSTALL_ROOT"
   mv "${INSTALL_ROOT}/solr-${SOLR_VERSION}" "$SOLR_DIR"
   chown -R "$DSPACE_USER:$DSPACE_USER" "$SOLR_DIR"
@@ -185,8 +347,7 @@ fi
 if [[ ! -d "$TOMCAT_DIR" ]]; then
   log "Downloading Apache Tomcat ${TOMCAT_VERSION}"
   TC_MAJOR="${TOMCAT_VERSION%%.*}"
-  wget -q -O "/tmp/tomcat-${TOMCAT_VERSION}.tar.gz" \
-    "https://archive.apache.org/dist/tomcat/tomcat-${TC_MAJOR}/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz"
+  apache_get "tomcat/tomcat-${TC_MAJOR}/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz" "/tmp/tomcat-${TOMCAT_VERSION}.tar.gz"
   tar xzf "/tmp/tomcat-${TOMCAT_VERSION}.tar.gz" -C "$INSTALL_ROOT"
   mv "${INSTALL_ROOT}/apache-tomcat-${TOMCAT_VERSION}" "$TOMCAT_DIR"
   chown -R "$DSPACE_USER:$DSPACE_USER" "$TOMCAT_DIR"
@@ -197,8 +358,13 @@ grep -q 'URIEncoding="UTF-8"' "${TOMCAT_DIR}/conf/server.xml" || \
 
 SRC="DSpace-dspace-${DSPACE_VERSION}"
 log "Downloading DSpace ${DSPACE_VERSION} source"
-run_as_dspace "mkdir -p ~/build && cd ~/build && \
-  [ -d '${SRC}' ] || { wget -q -O ds.tgz 'https://github.com/DSpace/DSpace/archive/refs/tags/dspace-${DSPACE_VERSION}.tar.gz' && tar -zxf ds.tgz && rm ds.tgz; }"
+if [[ ! -d "${DSPACE_HOME}/build/${SRC}" ]]; then
+  cached_get "https://github.com/DSpace/DSpace/archive/refs/tags/dspace-${DSPACE_VERSION}.tar.gz" /tmp/dspace-src.tgz || \
+    die "Could not download the DSpace ${DSPACE_VERSION} source from GitHub."
+  chmod 644 /tmp/dspace-src.tgz
+  run_as_dspace "mkdir -p ~/build && cd ~/build && tar -zxf /tmp/dspace-src.tgz"
+  rm -f /tmp/dspace-src.tgz
+fi
 
 CFG="${DSPACE_HOME}/build/${SRC}/dspace/config/local.cfg"
 log "Writing local.cfg"
@@ -217,7 +383,7 @@ setcfg "solr.server"               "http://localhost:${SOLR_PORT}/solr"
 setcfg "rest.cors.allowed-origins" "\${dspace.ui.url}"
 
 log "Building DSpace (mvn package) - this takes ~8-10 minutes"
-run_as_dspace "cd ~/build/${SRC} && mvn -B -q package"
+run_as_dspace "cd ~/build/${SRC} && mvn -B -ntp${MVN_CACHE} package"
 log "Deploying DSpace (ant fresh_install)"
 run_as_dspace "cd ~/build/${SRC}/dspace/target/dspace-installer && ant -q fresh_install"
 
@@ -237,10 +403,10 @@ else
   ICU_POM="https://repo1.maven.org/maven2/org/apache/lucene/lucene-analysis-icu/${LUCENE_VER}/lucene-analysis-icu-${LUCENE_VER}.pom"
   ICU4J_VER="$(curl -s "$ICU_POM" | tr -d '\n\r\t ' | grep -oP 'icu4j</artifactId><version>\K[0-9.]+' | head -1)"
   [[ -z "$ICU4J_VER" ]] && { ICU4J_VER="74.2"; warn "Could not parse icu4j version; defaulting to ${ICU4J_VER}"; }
-  wget -q -O "${SOLR_LIB}/lucene-analysis-icu-${LUCENE_VER}.jar" \
-    "https://repo1.maven.org/maven2/org/apache/lucene/lucene-analysis-icu/${LUCENE_VER}/lucene-analysis-icu-${LUCENE_VER}.jar"
-  wget -q -O "${SOLR_LIB}/icu4j-${ICU4J_VER}.jar" \
-    "https://repo1.maven.org/maven2/com/ibm/icu/icu4j/${ICU4J_VER}/icu4j-${ICU4J_VER}.jar"
+  cached_get "https://repo1.maven.org/maven2/org/apache/lucene/lucene-analysis-icu/${LUCENE_VER}/lucene-analysis-icu-${LUCENE_VER}.jar" \
+    "${SOLR_LIB}/lucene-analysis-icu-${LUCENE_VER}.jar"
+  cached_get "https://repo1.maven.org/maven2/com/ibm/icu/icu4j/${ICU4J_VER}/icu4j-${ICU4J_VER}.jar" \
+    "${SOLR_LIB}/icu4j-${ICU4J_VER}.jar"
 fi
 chown -R "$DSPACE_USER:$DSPACE_USER" "$SOLR_LIB"
 
@@ -305,11 +471,24 @@ systemctl enable --now tomcat.service
 
 log "Installing Node.js ${NODE_VERSION} (nvm) and PM2"
 run_as_dspace "[ -d ~/.nvm ] || curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash"
-run_as_dspace "export NVM_DIR=~/.nvm; . ~/.nvm/nvm.sh; nvm install ${NODE_VERSION}; npm install -g pm2"
+if [[ -n "$DOWNLOAD_CACHE" ]]; then
+  # nvm keeps the Node.js archives it downloads in ~/.nvm/.cache and reuses them when their checksum matches.
+  run_as_dspace "[ -e ~/.nvm/.cache ] || { rm -f ~/.nvm/.cache; ln -s '${DOWNLOAD_CACHE}/nvm' ~/.nvm/.cache; }" || \
+    warn "Could not point nvm's cache at ${DOWNLOAD_CACHE}/nvm."
+elif [[ -L "${DSPACE_HOME}/.nvm/.cache" && ! -e "${DSPACE_HOME}/.nvm/.cache" ]]; then
+  rm -f "${DSPACE_HOME}/.nvm/.cache"   # left by an earlier run whose download cache has since been deleted
+fi
+run_as_dspace "export NVM_DIR=~/.nvm; . ~/.nvm/nvm.sh; ${NPM_CACHE}nvm install ${NODE_VERSION}; npm install -g pm2"
 
 FE="dspace-angular-dspace-${DSPACE_VERSION}"
 log "Downloading dspace-angular ${DSPACE_VERSION}"
-run_as_dspace "cd ~ && [ -d '${FE}' ] || { wget -q -O fe.tgz 'https://github.com/DSpace/dspace-angular/archive/refs/tags/dspace-${DSPACE_VERSION}.tar.gz' && tar -zxf fe.tgz && rm fe.tgz; }"
+if [[ ! -d "${DSPACE_HOME}/${FE}" ]]; then
+  cached_get "https://github.com/DSpace/dspace-angular/archive/refs/tags/dspace-${DSPACE_VERSION}.tar.gz" /tmp/dspace-angular-src.tgz || \
+    die "Could not download the dspace-angular ${DSPACE_VERSION} source from GitHub."
+  chmod 644 /tmp/dspace-angular-src.tgz
+  run_as_dspace "cd ~ && tar -zxf /tmp/dspace-angular-src.tgz"
+  rm -f /tmp/dspace-angular-src.tgz
+fi
 
 log "Writing frontend config.prod.yml"
 run_as_dspace "cat > ~/${FE}/config/config.prod.yml <<YML
@@ -326,7 +505,9 @@ ui:
 YML"
 
 log "Installing UI dependencies + building - ~12 min"
-run_as_dspace "export NVM_DIR=~/.nvm; . ~/.nvm/nvm.sh; cd ~/${FE}; npm install; \
+# dspace-angular's dev dependencies include the Cypress test runner, which a production server never uses,
+# so npm install skips its download.
+run_as_dspace "export NVM_DIR=~/.nvm; . ~/.nvm/nvm.sh; ${NPM_CACHE}cd ~/${FE}; CYPRESS_INSTALL_BINARY=0 npm install; \
   export NODE_OPTIONS='--max-old-space-size=${NODE_HEAP_MB}'; npm run build:prod"
 
 log "Configuring PM2"
@@ -368,6 +549,12 @@ if [[ "$UFW_STATE" != *"Status: active"* && "$INPUT_RULES" == *"-j REJECT"* ]]; 
   fi
 fi
 
+if [[ "${SAVED_SECRETS:-0}" == "1" ]]; then
+  warn "The generated passwords are in ${CREDENTIALS_FILE} (readable by root only). Show them with: sudo cat ${CREDENTIALS_FILE}"
+fi
+CACHE_DONE=""
+[[ -n "$DOWNLOAD_CACHE" ]] && CACHE_DONE=$'\n'"   Download cache: ${DOWNLOAD_CACHE} ($(cache_size); copy the folder to reuse it)"
+
 cat <<DONE
 
   ================================================================
@@ -376,6 +563,7 @@ cat <<DONE
    Frontend (UI) : ${UI_URL}
    Backend (API) : ${SERVER_URL}
    Admin login   : ${ADMIN_EMAIL}
+   Install log   : ${INSTALL_LOG}${CACHE_DONE}
 
    Services (systemd): solr, tomcat   |   UI: pm2 (user ${DSPACE_USER})
      systemctl status solr tomcat
