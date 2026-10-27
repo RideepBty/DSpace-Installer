@@ -220,8 +220,9 @@ if [[ -n "$DOWNLOAD_CACHE" ]]; then
 fi
 
 # Swap: the frontend build needs more memory than a small VM has. Ubuntu Server usually comes with a swap file
-# of its own, and a second one only takes disk space, so the installer adds one only when the system has less
-# swap than SWAP_SIZE.
+# of its own, and a second one only takes disk space, so the installer adds one only when the system has clearly
+# less swap than SWAP_SIZE (under 95% of it: a 4 GB swap file shows as 4 KB less, because its first page holds
+# the swap header).
 size_bytes() {  # 4G or 4GiB = 4 x 1024^3 bytes, as fallocate reads them; 4GB = 4 x 1000^3
   local s="${1^^}"
   case "$s" in
@@ -239,7 +240,7 @@ elif [[ -f /swapfile ]]; then
 else
   SWAP_WANT="$(size_bytes "$SWAP_SIZE" 2>/dev/null || true)"
   [[ "$SWAP_WANT" =~ ^[0-9]+$ ]] || die "SWAP_SIZE must be a size such as 4G or 2048M, or 0 for no swap file."
-  if (( SWAP_HAVE < SWAP_WANT )); then
+  if (( SWAP_HAVE * 20 < SWAP_WANT * 19 )); then
     MAKE_SWAP=1 SWAP_LINE="new ${SWAP_SIZE} file"
   else
     SWAP_LINE="the system's own $(awk -v b="$SWAP_HAVE" 'BEGIN {printf "%.1f", b / 1073741824}') GB (no new file)"
