@@ -26,7 +26,7 @@ TOMCAT_DIR="${TOMCAT_DIR:-/opt/tomcat}"
 DSPACE_USER="${DSPACE_USER:-dspace}"
 STAGE_MARK="${STAGE_MARK:-==>}"
 SECRETS="/root/dspace-test-secrets.env"
-WRAPPER_VERSION="1.2"
+WRAPPER_VERSION="1.3"
 CACHE_DIR="${DOWNLOAD_CACHE:-/var/cache/dspace-installer}"
 
 LABEL="" REF="main" SCRIPT="install-dspace10.sh" FILE="" INTERRUPT="" CHECK_ONLY=0 NOTE="" PROVIDER_ARG="" CACHE=0
@@ -319,6 +319,20 @@ LOCALHOST_URL="no"
 API_PUBLIC="" UI_PUBLIC=""
 [[ -n "$SERVER_URL" ]] && API_PUBLIC="$(code "$SERVER_URL/api")"
 [[ -n "$UI_URL" ]] && UI_PUBLIC="$(code "$UI_URL/")"
+# The UI's own idea of its public address: robots.txt lists the sitemap there. DSpace 10 takes it from the UI's
+# baseUrl setting (http://localhost:4000 when unset), which it also uses for redirects and Google Scholar tags.
+SITEMAP_URL="" UI_BASE_OK=""
+if [[ -n "$UI_URL" ]]; then
+  SITEMAP_URL="$(curl -s --max-time 20 "$UI_URL/robots.txt" 2>/dev/null | tr -d '\r' |
+    sed -n 's/^[Ss]itemap:[[:space:]]*//p' | head -1)"
+  if [[ -z "$SITEMAP_URL" ]]; then
+    UI_BASE_OK="unknown"
+  elif [[ "$SITEMAP_URL" == "${UI_URL%/}/"* ]]; then
+    UI_BASE_OK="yes"
+  else
+    UI_BASE_OK="no"
+  fi
+fi
 
 LOGIN="000"
 if [[ "$API_LOCAL" == "200" ]]; then
@@ -368,7 +382,7 @@ fi
 PASS="no"
 if [[ "$KIND" != "interrupted" && ( "$KIND" == "check" || "$EXIT" == "0" ) && "$API_LOCAL" == "200" &&
       "$API_PUBLIC" == "200" && "$LOCALHOST_URL" == "no" && "$UI_LOCAL" == "200" && "$LOGIN" == "200" &&
-      "$SOLR_SEARCH" == "yes" ]]; then
+      "$SOLR_SEARCH" == "yes" && "$UI_BASE_OK" == "yes" ]]; then
   PASS="yes"
 fi
 
@@ -377,6 +391,7 @@ fi
   echo "api_public:  ${API_PUBLIC:-n/a}   (${SERVER_URL:-no URL}/api, from $URL_SOURCE; localhost URL: $LOCALHOST_URL)"
   echo "ui_local:    $UI_LOCAL   (http://localhost:$UI_PORT/)"
   echo "ui_public:   ${UI_PUBLIC:-n/a}   (${UI_URL:-no URL}/)"
+  echo "ui_address:  ${UI_BASE_OK:-n/a}   (robots.txt sitemap: ${SITEMAP_URL:-none}; expected under ${UI_URL:-?}/)"
   echo "login:       $LOGIN   (POST /server/api/authn/login as $ADMIN_EMAIL)"
   echo "solr_cores:  $SOLR_CORES (search core: $SOLR_SEARCH)"
   echo "services:    postgresql=$SVC_PG solr=$SVC_SOLR tomcat=$SVC_TOMCAT pm2-$DSPACE_USER=$SVC_PM2"
@@ -405,7 +420,8 @@ RR_ROW="$(python3 -c 'import json,sys; print(json.dumps(dict(zip(sys.argv[1::2],
   svc_tomcat "$SVC_TOMCAT" svc_pm2 "$SVC_PM2" uriencoding_count "$URIENC" nested_webapp "$NESTED" \
   oom_kills "$OOM" disk_used_gb "$DISK_USED" java "$JAVA_V" node "$NODE_V" dspace "$DSPACE_V" \
   pass "$PASS" note "$NOTE" wrapper_version "$WRAPPER_VERSION" \
-  cache "$CACHE_USED" cache_mb_at_start "$CACHE_MB_START" cache_mb_at_end "$CACHE_MB_END")"
+  cache "$CACHE_USED" cache_mb_at_start "$CACHE_MB_START" cache_mb_at_end "$CACHE_MB_END" \
+  ui_sitemap_url "$SITEMAP_URL" ui_base_ok "$UI_BASE_OK")"
 
 python3 - <<'PY'
 import bisect, csv, json, os, re
@@ -470,7 +486,7 @@ cols = ["run_id", "label", "kind", "pass", "date_utc", "start_utc", "end_utc", "
         "ui_local", "ui_public", "login", "solr_cores", "solr_search",
         "svc_postgresql", "svc_solr", "svc_tomcat", "svc_pm2", "uriencoding_count", "nested_webapp",
         "oom_kills", "disk_used_gb", "java", "node", "dspace", "note", "wrapper_version",
-        "cache", "cache_mb_at_start", "cache_mb_at_end"]
+        "cache", "cache_mb_at_start", "cache_mb_at_end", "ui_sitemap_url", "ui_base_ok"]
 json.dump(row, open(os.path.join(d, "result.json"), "w"), indent=2)
 results = os.path.join(os.path.dirname(d), "results.csv")
 new = not os.path.exists(results)
@@ -496,7 +512,7 @@ chown -R "$OWNER": "$RUNS" 2>/dev/null || true
 cat <<EOF
 
 [record-run] ${RUN_ID}: kind=${KIND} exit=${EXIT:-n/a} pass=${PASS} cache=${CACHE_USED}
-             API ${API_LOCAL} (public ${API_PUBLIC:-n/a})  UI ${UI_LOCAL}  login ${LOGIN}  Solr cores ${SOLR_CORES}
+             API ${API_LOCAL} (public ${API_PUBLIC:-n/a})  UI ${UI_LOCAL} (address ${UI_BASE_OK:-n/a})  login ${LOGIN}  Solr cores ${SOLR_CORES}
              saved in ${DIR}
 EOF
 [[ -f "$DIR/terminal.txt" ]] && echo "             last lines of the output:  tail -n 60 $DIR/terminal.txt"

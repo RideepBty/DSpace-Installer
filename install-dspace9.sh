@@ -105,6 +105,26 @@ cached_get() {  # cached_get <url> <output file>
   return 0
 }
 
+# Ubuntu's automatic updates hold apt's locks for a while after a server starts. apt-get install waits for its
+# lock (DPkg::Lock::Timeout); apt-get update doesn't, so apt_update tries again for up to 10 minutes.
+APT_WAIT=(-o DPkg::Lock::Timeout=600)
+apt_update() {
+  local i err
+  err="$(mktemp)"
+  for i in $(seq 1 60); do
+    if apt-get "${APT_WAIT[@]}" update -y 2>"$err"; then
+      cat "$err" >&2; rm -f "$err"; return 0
+    fi
+    if ! grep -q 'Could not get lock' "$err"; then
+      cat "$err" >&2; rm -f "$err"; return 1
+    fi
+    [[ $i -eq 1 ]] && echo "  Another apt program (probably Ubuntu's automatic updates) is running; waiting for it (up to 10 minutes)..." >&2
+    sleep 10
+  done
+  rm -f "$err"
+  die "apt-get update could not start: another apt program was still running after 10 minutes."
+}
+
 ASSUME_YES="${ASSUME_YES:-0}"
 
 DSPACE_VERSION="${DSPACE_VERSION:-9.2}"
@@ -154,6 +174,7 @@ ask_secret() {
     else
       printf -v "$var" '%s' "$(openssl rand -base64 12)"
       GENERATED_SECRETS=1
+      if [[ "$var" == "DB_PASS" ]]; then DB_PASS_GENERATED=1; fi
       warn "$var not set; generated a random value."
     fi
     SAVED_SECRETS=1
@@ -197,11 +218,96 @@ if [[ -n "$DOWNLOAD_CACHE" ]]; then
   APT_CACHE=(-o "Dir::Cache::Archives=${DOWNLOAD_CACHE}/apt/")
 fi
 
+# Swap: the frontend build needs more memory than a small VM has. Ubuntu Server usually comes with a swap file
+# of its own, and a second one only takes disk space, so the installer adds one only when the system has less
+# swap than SWAP_SIZE.
+size_bytes() {  # 4G or 4GiB = 4 x 1024^3 bytes, as fallocate reads them; 4GB = 4 x 1000^3
+  local s="${1^^}"
+  case "$s" in
+    *IB) numfmt --from=iec "${s%IB}" ;;
+    *B)  numfmt --from=si "${s%B}" ;;
+    *)   numfmt --from=iec "$s" ;;
+  esac
+}
+MAKE_SWAP=0 SWAP_WANT=0
+SWAP_HAVE="$(swapon --show=SIZE --bytes --noheadings 2>/dev/null | awk '{s += $1} END {print s + 0}')"
+if [[ "$SWAP_SIZE" == "0" ]]; then
+  SWAP_LINE="none (SWAP_SIZE=0)"
+elif [[ -f /swapfile ]]; then
+  SWAP_LINE="existing /swapfile"
+else
+  SWAP_WANT="$(size_bytes "$SWAP_SIZE" 2>/dev/null || true)"
+  [[ "$SWAP_WANT" =~ ^[0-9]+$ ]] || die "SWAP_SIZE must be a size such as 4G or 2048M, or 0 for no swap file."
+  if (( SWAP_HAVE < SWAP_WANT )); then
+    MAKE_SWAP=1 SWAP_LINE="new ${SWAP_SIZE} file"
+  else
+    SWAP_LINE="the system's own $(awk -v b="$SWAP_HAVE" 'BEGIN {printf "%.1f", b / 1073741824}') GB (no new file)"
+  fi
+fi
+
+# Free disk space. A first install needs about 8.5 GB (build folders, Solr, Tomcat, Java, PostgreSQL), plus the
+# swap file and the download cache; a re-run needs much less. Without this check a disk that is too small stops
+# the install near its end, in the frontend build. SKIP_DISK_CHECK=1 skips the check.
+declare -A NEED_MB=()
+need_space() {  # need_space <path> <MB>: the filesystem holding <path> needs <MB> more free
+  local p="$1" mnt
+  while [[ ! -e "$p" ]]; do p="$(dirname "$p")"; done
+  mnt="$(df -P "$p" | awk 'NR == 2 {print $6}')"
+  NEED_MB["$mnt"]=$(( ${NEED_MB["$mnt"]:-0} + $2 ))
+}
+lvm_hint() {  # a filesystem on LVM whose volume group has unused space: say how to add it
+  local src vg free
+  command -v lvs >/dev/null 2>&1 || return 0
+  src="$(findmnt -no SOURCE --target "$1" 2>/dev/null || true)"
+  [[ "$src" == /dev/mapper/* ]] || return 0
+  vg="$(lvs --noheadings -o vg_name "$src" 2>/dev/null | tr -d '[:space:]')"
+  [[ -n "$vg" ]] || return 0
+  free="$(vgs --noheadings --units m --nosuffix -o vg_free "$vg" 2>/dev/null | tr -d '[:space:]')"
+  free="${free%%.*}"
+  [[ "$free" =~ ^[0-9]+$ ]] && (( free >= 1024 )) || return 0
+  printf '\n    Its LVM volume group %s has %s GB unused (Ubuntu Server uses only part of the disk by default).\n    To add it: sudo lvextend -r -l +100%%FREE %s' "$vg" "$(( free / 1024 ))" "$src"
+}
+check_disk_space() {
+  local home mnt free need figures short="" extra=""
+  home="$(getent passwd "$DSPACE_USER" | cut -d: -f6 || true)"
+  home="${home:-/home/$DSPACE_USER}"
+  if [[ -f "${DSPACE_DIR}/config/local.cfg" ]]; then
+    need_space "$home" 2048            # a re-run builds again in the folders the first run made
+  else
+    need_space "$home" 5120            # DSpace and dspace-angular build folders, Maven and npm packages, Node.js
+    need_space "$INSTALL_ROOT" 1024    # Solr, Tomcat and Maven
+    need_space "$DSPACE_DIR" 1024      # DSpace itself
+    need_space /usr 1024               # Java, PostgreSQL and the other packages
+    need_space /tmp 512                # downloaded archives
+  fi
+  if [[ $MAKE_SWAP -eq 1 ]]; then need_space / $(( SWAP_WANT / 1048576 )); extra+=", a ${SWAP_SIZE} swap file"; fi
+  if [[ -n "$DOWNLOAD_CACHE" ]]; then need_space "$DOWNLOAD_CACHE" 2048; extra+=", 2 GB for the download cache"; fi
+  for mnt in "${!NEED_MB[@]}"; do
+    need="${NEED_MB[$mnt]}"
+    free="$(df -Pm "$mnt" | awk 'NR == 2 {print $4}')"
+    figures="$(awk -v f="$free" -v n="$need" 'BEGIN {printf "%.1f GB free, about %.1f GB needed", f / 1024, n / 1024}')"
+    if (( free < need )); then
+      short+=$'\n'"  ${mnt}: ${figures}$(lvm_hint "$mnt")"
+    else
+      echo "  Disk space on ${mnt}: ${figures}"
+    fi
+  done
+  [[ -z "$short" ]] && return 0
+  die "Not enough free disk space:${short}
+  The figures cover DSpace and its build${extra}.
+  Free some space or give the server a bigger disk, then run the installer again. SKIP_DISK_CHECK=1 skips this check."
+}
+if [[ "${SKIP_DISK_CHECK:-0}" == "1" ]]; then
+  warn "Not checking free disk space (SKIP_DISK_CHECK=1)."
+else
+  check_disk_space
+fi
+
 # Minimal Ubuntu images leave out curl, which the address detection below needs.
 if ! command -v curl >/dev/null 2>&1; then
   log "Installing curl (needed to find the public address)"
-  DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null
-  DEBIAN_FRONTEND=noninteractive apt-get "${APT_CACHE[@]}" install -y curl >/dev/null
+  apt_update >/dev/null
+  DEBIAN_FRONTEND=noninteractive apt-get "${APT_WAIT[@]}" "${APT_CACHE[@]}" install -y curl >/dev/null
 fi
 
 log "DSpace 9 installer - configuration"
@@ -259,7 +365,7 @@ cat <<SUMMARY
    Service user: ${DSPACE_USER}        Install dir: ${DSPACE_DIR}
    Database    : ${DB_NAME} / ${DB_USER}
    Admin login : ${ADMIN_EMAIL}
-   Swap        : ${SWAP_SIZE}     Node build heap: ${NODE_HEAP_MB} MB${CACHE_LINE}
+   Swap        : ${SWAP_LINE}     Node build heap: ${NODE_HEAP_MB} MB${CACHE_LINE}
   ----------------------------------------------------------------
 SUMMARY
 
@@ -283,7 +389,7 @@ TOMCAT_DIR="${INSTALL_ROOT}/tomcat"
 SOLR_LIB="${SOLR_DIR}/server/solr/lib"
 run_as_dspace() { sudo -u "$DSPACE_USER" bash -lc "$1"; }
 
-if [[ "$SWAP_SIZE" != "0" && ! -f /swapfile ]]; then
+if [[ $MAKE_SWAP -eq 1 ]]; then
   log "Creating ${SWAP_SIZE} swap file"
   fallocate -l "$SWAP_SIZE" /swapfile
   chmod 600 /swapfile
@@ -295,8 +401,8 @@ fi
 log "Installing system dependencies (Java 17, Maven, Ant, PostgreSQL, tools)"
 export DEBIAN_FRONTEND=noninteractive
 if command -v netfilter-persistent >/dev/null 2>&1; then FW_PKG=""; else FW_PKG="ufw"; fi
-apt-get update -y
-apt-get "${APT_CACHE[@]}" install -y openjdk-17-jdk maven ant postgresql postgresql-contrib \
+apt_update
+apt-get "${APT_WAIT[@]}" "${APT_CACHE[@]}" install -y openjdk-17-jdk maven ant postgresql postgresql-contrib \
   libpostgresql-jdbc-java curl wget git unzip ${FW_PKG:+"$FW_PKG"}
 
 JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")"
@@ -319,9 +425,33 @@ if [[ -n "$DOWNLOAD_CACHE" ]]; then
   NPM_CACHE="export npm_config_cache='${DOWNLOAD_CACHE}/npm' npm_config_prefer_offline=true; "
 fi
 
+# A re-run finds the database user an earlier run created. DSpace is given the password asked for now, so it must
+# be that user's password; otherwise DSpace's database test fails, and only at the end of the 10-minute build.
+check_db_pass() {
+  local db=postgres out
+  if sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" | grep -q 1; then db="$DB_NAME"; fi
+  if out="$(PGPASSWORD="$DB_PASS" PGCONNECT_TIMEOUT=10 psql -h 127.0.0.1 -U "$DB_USER" -d "$db" -tAc 'SELECT 1' 2>&1)"; then
+    echo "  The database user '${DB_USER}' exists from an earlier run, and the password matches."
+    return 0
+  fi
+  if [[ "$out" != *"password authentication failed"* ]]; then
+    warn "Could not check the password of the existing database user '${DB_USER}': ${out}"
+    return 0
+  fi
+  # A password generated by this run must not be reused by the next unattended run.
+  if [[ "${DB_PASS_GENERATED:-0}" == "1" && -f "$CREDENTIALS_FILE" ]]; then sed -i '/^DB_PASS=/d' "$CREDENTIALS_FILE"; fi
+  die "The database user '${DB_USER}' already exists from an earlier install, and the database password given now doesn't match it.
+  Run the installer again with that install's database password: it is the db.password line in ${DSPACE_DIR}/config/local.cfg
+  (unattended: sudo DB_PASS='...' ASSUME_YES=1 bash $(basename "$0")).
+  Or give the user a new password first: sudo -u postgres psql -c \"ALTER ROLE ${DB_USER} PASSWORD 'new-password'\""
+}
+
 log "Configuring PostgreSQL role '${DB_USER}' and database '${DB_NAME}'"
-sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" | grep -q 1 || \
+if sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" | grep -q 1; then
+  check_db_pass
+else
   sudo -u postgres psql -c "CREATE ROLE ${DB_USER} LOGIN PASSWORD '${DB_PASS}';"
+fi
 sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" | grep -q 1 || \
   sudo -u postgres createdb --owner="${DB_USER}" --encoding=UNICODE "${DB_NAME}"
 

@@ -19,7 +19,8 @@ from collections import defaultdict
 
 CHECKS = [("exit_code", "0", "exit"), ("api_local", "200", "API"), ("api_public", "200", "public API"),
           ("rest_url_localhost", "no", "localhost URL"), ("ui_local", "200", "UI"), ("login", "200", "login"),
-          ("solr_search", "yes", "Solr")]
+          ("solr_search", "yes", "Solr"), ("ui_base_ok", "yes", "UI address")]
+OPTIONAL = {"ui_base_ok"}  # recorded from record-run.sh 1.3 on; rows from older versions don't have it
 MACHINES = {"local": "Local VM", "oracle": "Oracle Cloud", "ibm": "IBM Cloud", "akamai": "Akamai",
             "aws": "AWS", "azure": "Azure", "gcp": "Google Cloud"}
 ROBUST = re.compile(r"-(rerun|int\d*|resume|reboot)(-\d+)?$")
@@ -81,7 +82,9 @@ def vm_type(r):
 
 def failed_checks(r):
     return ", ".join(name for key, ok, name in CHECKS
-                     if not (r.get("kind") == "check" and key == "exit_code") and r.get(key, "") != ok)
+                     if not (r.get("kind") == "check" and key == "exit_code")
+                     and not (key in OPTIONAL and not r.get(key))
+                     and r.get(key, "") != ok)
 
 
 def table(head, body):
